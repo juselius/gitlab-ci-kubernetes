@@ -126,8 +126,6 @@ publish:release:
      kubectl config use-context default
   script:
     - helm list
-  dependencies:
-    - build:helm
 
 deploy:staging:
   extends: .deploy
