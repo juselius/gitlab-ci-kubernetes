@@ -1,0 +1,155 @@
+stages:
+  - prepare
+  - build
+  - test
+  - publish
+  - deploy
+
+services:
+  - name: postgres:latest
+  - name: docker:dind
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+       cp $CLUSTER_CA /usr/local/share/ca-certificates/ && \
+       update-ca-certificates && \
+       exec /usr/local/bin/dockerd-entrypoint.sh
+
+variables:
+   DOCKER_HOST: tcp://localhost:2375/
+   DOCKER_DRIVER: overlay2
+   CLUSTER_CA: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+   POSTGRES_DB: example
+   POSTGRES_USER: example
+   POSTGRES_PASSWORD: example
+
+.kaniko:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  before_script:
+    - |-
+      echo "{
+          \"auths\": {
+              \"$CI_REGISTRY\" :{
+                  \"username\":\"$CI_REGISTRY_USER\",
+                  \"password\":\"$CI_REGISTRY_PASSWORD\"}
+               }
+           }" > /kaniko/.docker/config.json
+    - cat $CLUSTER_CA >> /kaniko/ssl/certs/ca-certificates.crt
+  script:
+    - |-
+      /kaniko/executor \
+        --context $CI_PROJECT_DIR \
+        --dockerfile $CI_PROJECT_DIR/Dockerfile \
+        --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+create sdk:
+  stage: prepare
+  extends: .kaniko
+  script:
+    - |-
+      /kaniko/executor \
+        --context $CI_PROJECT_DIR \
+        --dockerfile $CI_PROJECT_DIR/Dockerfile.sdk \
+        --destination $CI_REGISTRY_IMAGE:sdk
+  only:
+    changes:
+      - Dockerfile.sdk
+      - paket.dependencies
+      - paket.lock
+
+.build:
+  stage: build
+  image:
+    name: $CI_REGISTRY_IMAGE:sdk
+  before_script:
+    - mono .paket/paket.exe restore
+  script:
+    - cd example; dotnet publish -c Debug -o ../dist
+  artifacts:
+    paths:
+      - dist/
+      - scripts/
+    expire_in: 2 hrs
+
+build:debug:
+  extends: .build
+
+build:release:
+  extends: .build
+  script:
+    - cd example; dotnet publish -c Release -o ../dist
+
+test:debug:
+  stage: test
+  image:
+    name: mcr.microsoft.com/dotnet/core/aspnet:2.2-alpine3.9
+  variables:
+      GIT_STRATEGY: none
+  script:
+    - cd dist
+    - dotnet Server.dll
+  dependencies:
+    - build:debug
+
+publish:release:
+  stage: publish
+  extends: .kaniko
+  dependencies:
+    - build:release
+
+# Adding a Kubernetes cluster to a gitlab project gives access to a set of
+# KUBE_* envirnonment variables:
+# 1. Connect your gitlab project to Kubernetes, with the desired/correct
+#    namespace. NB! Changing the namespace in gitlab breaks things badly.
+#    Instead delete the cluster in gitlab, and creat a new cluster with the
+#    new desired namespace.
+# 2. If you want to use helm, you must install tiller in $KUBE_NAMESPACE
+#    before deploying:
+#    $ helm init --tiller-namespace ${KUBE_NAMESPACE} \
+#      --service-account ${KUBE_NAMESPACE}-service-account
+.deploy:
+  image: juselius/helmand:latest
+  stage: deploy
+  variables:
+      GIT_STRATEGY: none
+      TILLER_NAMESPACE: $KUBE_NAMESPACE
+  before_script:
+    - |
+     cp $CLUSTER_CA /usr/local/share/ca-certificates/
+     update-ca-certificates
+     docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+     kubectl config set-cluster default --server="$KUBE_URL"
+     kubectl config set-credentials admin --token="$KUBE_TOKEN"
+     kubectl config set-context default --cluster=default --user=admin
+     kubectl config use-context default
+  script:
+    - helm list
+  dependencies:
+    - build:helm
+
+deploy:staging:
+  extends: .deploy
+  environment:
+      name: staging
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:staging
+    - docker push $CI_REGISTRY_IMAGE:staging
+    - helm list
+    - kubectl delete pods -n example -lapp=example -lenvironment=staging
+  when: manual
+
+deploy:production:
+  extends: .deploy
+  environment:
+      name: production
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+    - helm list
+    - kubectl delete pods -n example -lapp=example -lenvironment=production
+  when: manual
+
